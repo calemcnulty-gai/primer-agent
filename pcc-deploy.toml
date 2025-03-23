@@ -1,0 +1,6 @@
+agent_name = "primer-agent"
+image = "calemcnulty/primer-agent:0.1"
+secret_set = "primer-agent-secrets"
+
+[scaling]
+	min_instances = 1
