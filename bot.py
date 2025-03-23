@@ -12,12 +12,11 @@ import json
 from dotenv import load_dotenv
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import LLMMessagesFrame, TextFrame
+from pipecat.frames.frames import LLMMessagesFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
-from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.services.cartesia import CartesiaTTSService
 from pipecat.services.openai import OpenAILLMService
 from pipecat.transports.services.daily import DailyParams, DailyTransport
@@ -62,92 +61,76 @@ async def generate_image(text: str) -> str:
     except Exception:
         return ""  # Silently fail outer exceptions
 
-class WebSocketSender(FrameProcessor):
-    """Processor to send data via WebSocket."""
-    def __init__(self, ws_url: str):
-        super().__init__()
-        self._ws_url = ws_url
-        self._websocket = None
+class CustomTTService(CartesiaTTSService):
+    """Custom TTS service that emits text events before generating audio."""
+    def __init__(self, *args, callback=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._callback = callback
 
-    async def start(self):
-        """Establish WebSocket connection."""
-        try:
-            self._websocket = await websockets.connect(self._ws_url)
-            logger.info("WebSocket connected to {}", self._ws_url)
-        except Exception as e:
-            logger.error("Failed to connect to WebSocket: {}", e)
+    async def run_tts(self, text: str):
+        """Override to capture text and yield audio frames."""
+        logger.debug("CustomTTSService processing text: {}", text)
+        if self._callback:
+            logger.info("Emitting text event: {}", text)
+            await self._callback(text)
+        async for frame in super().run_tts(text):
+            yield frame  # Yield each audio frame downstream
 
-    async def process_frame(self, frame, direction):
-        if hasattr(frame, "text") and self._websocket:
-            text_message = json.dumps({"type": "llm-text", "data": frame.text})
+async def websocket_listener(ws_url: str, text_queue: asyncio.Queue):
+    """Listen for text events and send them to WebSocket."""
+    ws = None
+    last_reconnect_attempt = 0
+    reconnect_interval = 5  # seconds
+
+    logger.info("Starting WebSocket listener for {}", ws_url)
+
+    async def connect():
+        nonlocal ws, last_reconnect_attempt
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
             try:
-                await self._websocket.send(text_message)
-                logger.debug("Sent LLM text via WebSocket: {}", frame.text)
+                logger.info("Connecting to WebSocket at {} (attempt {}/{})", ws_url, attempt, max_attempts)
+                ws = await websockets.connect(ws_url)
+                await ws.send(json.dumps({"type": "ping", "data": "Connection test from bot"}))
+                logger.info("WebSocket connected successfully to {}", ws_url)
+                return True
             except Exception as e:
-                logger.error("WebSocket text send failed: {}", e)
+                logger.error("WebSocket connection attempt {}/{} failed: {}", attempt, max_attempts, e)
+                if attempt < max_attempts:
+                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
+        logger.error("Failed to connect to WebSocket after {} attempts", max_attempts)
+        last_reconnect_attempt = asyncio.get_event_loop().time()
+        return False
 
-            image_url = await generate_image(frame.text)
-            if image_url:
-                image_message = json.dumps({"type": "llm-image", "data": image_url})
-                try:
-                    await self._websocket.send(image_message)
-                    logger.debug("Sent LLM image via WebSocket: {}", image_url)
-                except Exception as e:
-                    logger.error("WebSocket image send failed: {}", e)
+    await connect()
 
-        return await super().process_frame(frame, direction)
-
-    async def cleanup(self):
-        """Close WebSocket connection."""
-        if self._websocket:
-            await self._websocket.close()
-            logger.info("WebSocket closed")
-
-async def clear_room_except_bot(room_name: str, bot_id: str):
-    """Clear all participants except the bot from the room using Daily API."""
-    api_key = os.getenv("DAILY_API_KEY")
-    if not api_key:
-        logger.error("DAILY_API_KEY not set in environment variables")
-        return
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    async with aiohttp.ClientSession() as session:
+    while True:
         try:
-            async with session.get(
-                f"https://api.daily.co/v1/rooms/{room_name}/participants",
-                headers=headers
-            ) as resp:
-                if resp.status != 200:
-                    logger.error(f"Failed to list participants: {await resp.text()}")
-                    return
-                participants = await resp.json()
-        except Exception as e:
-            logger.error(f"Error listing participants: {str(e)}")
-            return
-
-        for participant in participants.get("data", []):
-            participant_id = participant.get("id")
-            if participant_id != bot_id:
+            text = await text_queue.get()
+            if ws:
                 try:
-                    async with session.post(
-                        f"https://api.daily.co/v1/rooms/{room_name}/participants/{participant_id}/eject",
-                        headers=headers
-                    ) as resp:
-                        if resp.status == 200:
-                            logger.info(f"Ejected participant: {participant_id}")
-                        else:
-                            logger.error(f"Failed to eject {participant_id}: {await resp.text()}")
+                    await ws.send(json.dumps({"type": "llm-text", "data": text}))
+                    logger.info("Sent to WebSocket: {}", text)
+                    image_url = await generate_image(text)
+                    if image_url:
+                        await ws.send(json.dumps({"type": "llm-image", "data": image_url}))
+                        logger.info("Sent image to WebSocket: {}", image_url)
                 except Exception as e:
-                    logger.error(f"Error ejecting participant {participant_id}: {str(e)}")
+                    logger.error("WebSocket send failed: {}", e)
+                    ws = None
+            else:
+                current_time = asyncio.get_event_loop().time()
+                if current_time - last_reconnect_attempt >= reconnect_interval:
+                    if await connect():
+                        continue
+            text_queue.task_done()
+        except Exception as e:
+            logger.error("Error in websocket_listener: {}", e)
+            await asyncio.sleep(1)
 
 async def main(room_url: str, token: str):
-    """Main pipeline setup and execution function."""
-    logger.debug("Starting bot in room: {}", room_url)
+    logger.info("Starting bot in room: {}", room_url)
 
-    # Extract room name from URL
     room_name = room_url.split("/")[-1]
 
     transport = DailyTransport(
@@ -162,11 +145,21 @@ async def main(room_url: str, token: str):
         ),
     )
 
-    tts = CartesiaTTSService(
-        api_key=os.getenv("CARTESIA_API_KEY"), voice_id=os.getenv("CARTESIA_VOICE_ID")
+    text_queue = asyncio.Queue()
+
+    async def on_tts_text(text):
+        await text_queue.put(text)
+
+    tts = CustomTTService(
+        api_key=os.getenv("CARTESIA_API_KEY"),
+        voice_id=os.getenv("CARTESIA_VOICE_ID"),
+        callback=on_tts_text
     )
 
-    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o")
+    llm = OpenAILLMService(
+        api_key=os.getenv("OPENAI_API_KEY"), 
+        model="gpt-4o"
+    )
 
     messages = [
         {
@@ -178,7 +171,7 @@ async def main(room_url: str, token: str):
                 "2. Ask interactive questions or present challenges within stories, adjusting based on responses. "
                 "3. Guide the user conversationally with encouragement and explanations. "
                 "4. The user should be challenged but not overwhelmed. Don't give too much help, but give them hints if they need it. "
-                "When you receive 'User has joined', say 'Hello! I’m the Young Lady’s Illustrated Primer, here to share stories and adventures. What’s your name, and how old are you?' "
+                "When you receive 'User has joined', say 'Hello! I'm the Young Lady's Illustrated Primer, here to share stories and adventures. What's your name, and how old are you?' "
                 "Tailor stories to their age and interests. "
                 "Remember previous interactions in this session to maintain context and personalize responses. "
                 "Keep output simple for audio, avoiding special characters."
@@ -189,55 +182,16 @@ async def main(room_url: str, token: str):
     context = OpenAILLMContext(messages)
     context_aggregator = llm.create_context_aggregator(context)
 
-    ws_sender = WebSocketSender("ws://primer.calemcnulty.com:8081")
-    await ws_sender.start()
-
-    # Set up event handlers
-    bot_id = None
-    @transport.event_handler("on_joined")
-    async def on_joined(transport, data):
-        nonlocal bot_id
-        logger.info("on_joined data: {}", data)
-        if "participants" in data and "local" in data["participants"]:
-            bot_id = data["participants"]["local"]["id"]
-            logger.info("Bot joined with ID: {}", bot_id)
-            await clear_room_except_bot(room_name, bot_id)
-        else:
-            logger.error("Unable to find bot participant ID in on_joined data")
-
-    @transport.event_handler("on_participant_joined")
-    async def on_participant_joined(transport, participant):
-        if participant["id"] != bot_id:
-            logger.info("Client joined: {}", participant["id"])
-            await transport.capture_participant_transcription(participant["id"])  # Ensure transcription is captured
-            initial_message = {"role": "user", "content": "User has joined"}
-            messages.append(initial_message)
-            await task.queue_frames([LLMMessagesFrame(messages)])
-
-    @transport.event_handler("on_participant_left")
-    async def on_participant_left(transport, participant, reason):
-        logger.info("Participant left: {}", participant["id"])
-        logger.debug("Pipeline remains active")
-
-    @transport.event_handler("on_transcription_message")
-    async def on_transcription_message(transport, message):
-        logger.debug("Transcription received: {}", message)
-        if "text" in message and message["participant_id"] != bot_id:
-            user_message = {"role": "user", "content": message["text"]}
-            messages.append(user_message)
-            await task.queue_frames([LLMMessagesFrame(messages)])
-
-    # Create and start the pipeline immediately
-    pipeline = Pipeline(
-        [
-            transport.input(),
-            context_aggregator.user(),
-            llm,
-            tts,
-            transport.output(),
-            context_aggregator.assistant(),
-        ]
-    )
+    logger.info("Creating pipeline with components")
+    pipeline = Pipeline([
+        transport.input(),
+        context_aggregator.user(),
+        llm,
+        tts,
+        transport.output(),
+        context_aggregator.assistant(),
+    ])
+    logger.info("Pipeline created successfully")
 
     task = PipelineTask(
         pipeline,
@@ -249,11 +203,59 @@ async def main(room_url: str, token: str):
         ),
     )
 
+    asyncio.create_task(websocket_listener("ws://primer.calemcnulty.com:8081", text_queue))
+
+    bot_id = None
+    last_speech_time = None
+
+    @transport.event_handler("on_joined")
+    async def on_joined(transport, data):
+        nonlocal bot_id
+        logger.info("on_joined data: {}", data)
+        if "participants" in data and "local" in data["participants"]:
+            bot_id = data["participants"]["local"]["id"]
+            logger.info("Bot joined with ID: {}", bot_id)
+        else:
+            logger.error("Unable to find bot participant ID in on_joined data")
+
+    @transport.event_handler("on_participant_joined")
+    async def on_participant_joined(transport, participant):
+        if participant["id"] != bot_id:
+            logger.info("Client joined: {}", participant["id"])
+            await transport.capture_participant_transcription(participant["id"])
+            initial_message = {"role": "user", "content": "User has joined"}
+            messages.append(initial_message)
+            logger.info("Queuing initial greeting message: {}", initial_message)
+            await task.queue_frames([LLMMessagesFrame(messages)])
+
+    @transport.event_handler("on_participant_left")
+    async def on_participant_left(transport, participant, reason):
+        logger.info("Participant left: {}", participant["id"])
+        logger.info("Pipeline remains active")
+
+    @transport.event_handler("on_transcription_message")
+    async def on_transcription_message(transport, message):
+        nonlocal last_speech_time
+        logger.info("Transcription received: {}", message)
+        if "text" in message and message.get("participantId") != bot_id:
+            # Update last speech time when user speaks
+            last_speech_time = asyncio.get_event_loop().time()
+            user_message = {"role": "user", "content": message["text"]}
+            messages.append(user_message)
+            logger.info("Queuing user message: {}", message["text"])
+            # Wait 0.5 seconds after last speech to ensure user is done
+            while True:
+                current_time = asyncio.get_event_loop().time()
+                if current_time - last_speech_time >= 0.5:
+                    await task.queue_frames([LLMMessagesFrame(messages)])
+                    break
+                await asyncio.sleep(0.1)  # Check every 0.1s
+
     runner = PipelineRunner()
+    logger.info("Starting pipeline runner")
     await runner.run(task)
 
 async def bot(args: DailySessionArguments):
-    """Main bot entry point compatible with the FastAPI route handler."""
     logger.info(f"Bot process initialized with room {args.room_url} and token {args.token}")
     try:
         await main(args.room_url, args.token)
@@ -261,3 +263,12 @@ async def bot(args: DailySessionArguments):
     except Exception as e:
         logger.exception(f"Error in bot process: {str(e)}")
         raise
+
+if __name__ == "__main__":
+    import asyncio
+    args = DailySessionArguments(
+        room_url="https://your-daily-room-url.daily.co/room",
+        token="your-token-here",
+        session_id="test-session"
+    )
+    asyncio.run(bot(args))
