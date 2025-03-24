@@ -21,44 +21,39 @@ from pipecat.services.cartesia import CartesiaTTSService
 from pipecat.services.openai import OpenAILLMService
 from pipecat.transports.services.daily import DailyParams, DailyTransport
 from pipecatcloud.agent import DailySessionArguments
+from pipecat.processors.frame_processor import FrameProcessor
+from pipecat.functions.schema import FunctionSchema, ParameterSchema
 
 # Load environment variables
 load_dotenv(override=True)
 
 async def generate_image(text: str) -> str:
-    """Generate a small image using Replicate's Flux.1 Schnell model, silently ignoring errors."""
+    """Generate a small image using OpenAI's DALL-E model optimized for speed."""
     try:
         async with aiohttp.ClientSession() as session:
-            url = "https://api.replicate.com/v1/predictions"
+            url = "https://api.openai.com/v1/images/generations"
             headers = {
-                "Authorization": f"Token {os.getenv('REPLICATE_API_TOKEN')}",
+                "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}",
                 "Content-Type": "application/json",
             }
             payload = {
-                "version": "lucataco/flux.1schnell-uncensored-rasch3",
-                "input": {
-                    "prompt": f"A simple, colorful illustration of: {text}",
-                    "width": 256,
-                    "height": 256,
-                    "num_outputs": 1,
-                    "num_inference_steps": 4
-                }
+                "model": "dall-e-2",  # Using DALL-E 2 for faster generation
+                "prompt": f"A simple, colorful illustration of: {text}",
+                "n": 1,
+                "size": "512x512",
             }
             try:
                 async with session.post(url, json=payload, headers=headers) as resp:
-                    if resp.status != 201:
+                    if resp.status != 200:
+                        logger.error("DALL-E generation failed with status: {}", resp.status)
                         return ""  # Silently fail
                     data = await resp.json()
-                    prediction_id = data["id"]
-
-                while True:
-                    async with session.get(f"{url}/{prediction_id}", headers=headers) as resp:
-                        result = await resp.json()
-                        if result["status"] in ["succeeded", "failed"]:
-                            return result.get("output", [""])[0] if result["status"] == "succeeded" else ""
-            except Exception:
+                    return data["data"][0]["url"] if data.get("data") else ""
+            except Exception as e:
+                logger.error("DALL-E inner exception: {}", e)
                 return ""  # Silently fail inner exceptions
-    except Exception:
+    except Exception as e:
+        logger.error("DALL-E outer exception: {}", e)
         return ""  # Silently fail outer exceptions
 
 class CustomTTService(CartesiaTTSService):
@@ -76,7 +71,7 @@ class CustomTTService(CartesiaTTSService):
         async for frame in super().run_tts(text):
             yield frame  # Yield each audio frame downstream
 
-async def websocket_listener(ws_url: str, text_queue: asyncio.Queue):
+async def websocket_listener(ws_url: str, text_queue: asyncio.Queue, image_queue: asyncio.Queue):
     """Listen for text events and send them to WebSocket."""
     ws = None
     last_reconnect_attempt = 0
@@ -106,32 +101,47 @@ async def websocket_listener(ws_url: str, text_queue: asyncio.Queue):
 
     while True:
         try:
-            text = await text_queue.get()
-            if ws:
-                try:
-                    await ws.send(json.dumps({"type": "llm-text", "data": text}))
-                    logger.info("Sent to WebSocket: {}", text)
-                    image_url = await generate_image(text)
-                    if image_url:
-                        await ws.send(json.dumps({"type": "llm-image", "data": image_url}))
-                        logger.info("Sent image to WebSocket: {}", image_url)
-                except Exception as e:
-                    logger.error("WebSocket send failed: {}", e)
-                    ws = None
-            else:
+            # Handle text messages
+            if not text_queue.empty():
+                text = await text_queue.get()
+                if ws:
+                    try:
+                        await ws.send(json.dumps({"type": "llm-text", "data": text}))
+                        logger.info("Sent to WebSocket: {}", text)
+                    except Exception as e:
+                        logger.error("WebSocket text send failed: {}", e)
+                        ws = None
+                text_queue.task_done()
+            
+            # Handle image messages
+            if not image_queue.empty():
+                image_prompt = await image_queue.get()
+                if ws:
+                    try:
+                        logger.info("Generating image for prompt: {}", image_prompt)
+                        image_url = await generate_image(image_prompt)
+                        if image_url:
+                            await ws.send(json.dumps({"type": "llm-image", "data": image_url}))
+                            logger.info("Sent image to WebSocket: {}", image_url)
+                    except Exception as e:
+                        logger.error("WebSocket image send failed: {}", e)
+                        ws = None
+                image_queue.task_done()
+            
+            # Check connection state
+            if ws is None:
                 current_time = asyncio.get_event_loop().time()
                 if current_time - last_reconnect_attempt >= reconnect_interval:
-                    if await connect():
-                        continue
-            text_queue.task_done()
+                    await connect()
+            
+            # Small sleep to prevent busy-waiting
+            await asyncio.sleep(0.1)
         except Exception as e:
             logger.error("Error in websocket_listener: {}", e)
             await asyncio.sleep(1)
 
 async def main(room_url: str, token: str):
     logger.info("Starting bot in room: {}", room_url)
-
-    room_name = room_url.split("/")[-1]
 
     transport = DailyTransport(
         room_url,
@@ -146,6 +156,7 @@ async def main(room_url: str, token: str):
     )
 
     text_queue = asyncio.Queue()
+    image_queue = asyncio.Queue()
 
     async def on_tts_text(text):
         await text_queue.put(text)
@@ -156,9 +167,35 @@ async def main(room_url: str, token: str):
         callback=on_tts_text
     )
 
+    # Define function schema for image generation
+    generate_image_schema = FunctionSchema(
+        name="generate_image",
+        description="Generate an image based on a text description",
+        parameters=[
+            ParameterSchema(
+                name="prompt",
+                description="A detailed description of the image to generate",
+                type="string",
+                required=True
+            )
+        ]
+    )
+
+    # Define function handler for image generation
+    async def handle_generate_image(prompt: str):
+        logger.info("Function called: generate_image with prompt: {}", prompt)
+        await image_queue.put(prompt)
+        return {
+            "success": True,
+            "message": "Image generation has been requested and will be displayed shortly."
+        }
+
+    # Create LLM service with function calling capability
     llm = OpenAILLMService(
         api_key=os.getenv("OPENAI_API_KEY"), 
-        model="gpt-4o"
+        model="gpt-4o",
+        functions=[generate_image_schema],
+        function_handlers={"generate_image": handle_generate_image}
     )
 
     messages = [
@@ -174,7 +211,10 @@ async def main(room_url: str, token: str):
                 "When you receive 'User has joined', say 'Hello! I'm the Young Lady's Illustrated Primer, here to share stories and adventures. What's your name, and how old are you?' "
                 "Tailor stories to their age and interests. "
                 "Remember previous interactions in this session to maintain context and personalize responses. "
-                "Keep output simple for audio, avoiding special characters."
+                "End every response with the exact string ' {}'. So if your response was, 'how old are you?' you would return 'How old are you? {}'"
+                "\n\nYou have the ability to generate images to illustrate your stories and explanations. "
+                "When appropriate, use the generate_image function to create visual aids that complement your narrative. "
+                "This is especially useful when describing new concepts, characters in stories, or complex ideas."
             )
         }
     ]
@@ -185,9 +225,13 @@ async def main(room_url: str, token: str):
     logger.info("Creating pipeline with components")
     pipeline = Pipeline([
         transport.input(),
+        # LoggingProcessor(name="Input"),  # Log frames after input
         context_aggregator.user(),
+        # LoggingProcessor(name="Pre-LLM"),  # Log what's going into the LLM
         llm,
+        # LoggingProcessor(name="Post-LLM"),  # Log what's coming out of the LLM
         tts,
+        # LoggingProcessor(name="Pre-Output"),  # Log what's about to be output
         transport.output(),
         context_aggregator.assistant(),
     ])
@@ -202,8 +246,10 @@ async def main(room_url: str, token: str):
             report_only_initial_ttfb=True,
         ),
     )
+    logger.info("Pipeline task created with allow_interruptions=True")
+    logger.info("Note: If experiencing unwanted interruptions, you may want to set allow_interruptions=False")
 
-    asyncio.create_task(websocket_listener("ws://primer.calemcnulty.com:8081", text_queue))
+    asyncio.create_task(websocket_listener("ws://primer.calemcnulty.com:8081", text_queue, image_queue))
 
     bot_id = None
     last_speech_time = None
@@ -242,11 +288,21 @@ async def main(room_url: str, token: str):
             last_speech_time = asyncio.get_event_loop().time()
             user_message = {"role": "user", "content": message["text"]}
             messages.append(user_message)
-            logger.info("Queuing user message: {}", message["text"])
-            # Wait 0.5 seconds after last speech to ensure user is done
+            logger.info("Added user message to context: {}", message["text"])
+            logger.info("Current message history length: {}", len(messages))
+            
+            # Log the complete conversation context for debugging
+            logger.debug("Complete conversation context:")
+            for idx, msg in enumerate(messages):
+                logger.debug("[{}] {}: {}", idx, msg["role"], msg["content"])
+            
+            # Wait 1.5 seconds after last speech to ensure user is done (increased from 0.5)
+            logger.info("Waiting for user to complete speaking...")
             while True:
                 current_time = asyncio.get_event_loop().time()
-                if current_time - last_speech_time >= 0.5:
+                wait_time = current_time - last_speech_time
+                if wait_time >= 1.5:  # Increased from 0.5 to give more time
+                    logger.info("User speech pause detected after {:.2f}s, queuing message for LLM", wait_time)
                     await task.queue_frames([LLMMessagesFrame(messages)])
                     break
                 await asyncio.sleep(0.1)  # Check every 0.1s
@@ -263,6 +319,34 @@ async def bot(args: DailySessionArguments):
     except Exception as e:
         logger.exception(f"Error in bot process: {str(e)}")
         raise
+
+class LoggingProcessor(FrameProcessor):
+    """Custom processor for detailed logging of frames flowing through the pipeline."""
+    
+    def __init__(self, name="Pipeline"):
+        super().__init__()
+        self.name = name
+        
+    async def process_frame(self, frame, direction):
+        """Log detailed information about frames moving through the pipeline."""
+        logger.info("{} Processor: received frame of type {} in direction {}", 
+                   self.name, type(frame).__name__, direction)
+        
+        # Log frame content based on type
+        if hasattr(frame, "text"):
+            logger.info("{} Frame text content: {}", self.name, frame.text)
+        elif hasattr(frame, "messages"):
+            logger.info("{} Frame contains {} messages", self.name, len(frame.messages))
+            # Log the messages in the frame
+            for i, msg in enumerate(frame.messages):
+                logger.info("{} Message {}: {} - {}", 
+                           self.name, i, msg.get("role", "unknown"), 
+                           msg.get("content", "")[:50] + ("..." if len(msg.get("content", "")) > 50 else ""))
+        else:
+            logger.info("{} Unknown frame format", self.name)
+            
+        # Continue processing the frame
+        return await super().process_frame(frame, direction)
 
 if __name__ == "__main__":
     import asyncio
