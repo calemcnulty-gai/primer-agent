@@ -22,7 +22,8 @@ from pipecat.services.openai import OpenAILLMService
 from pipecat.transports.services.daily import DailyParams, DailyTransport
 from pipecatcloud.agent import DailySessionArguments
 from pipecat.processors.frame_processor import FrameProcessor
-from pipecat.functions.schema import FunctionSchema, ParameterSchema
+from pipecat.adapters.schemas.function_schema import FunctionSchema
+from pipecat.adapters.schemas.tools_schema import ToolsSchema
 
 # Load environment variables
 load_dotenv(override=True)
@@ -168,34 +169,43 @@ async def main(room_url: str, token: str):
     )
 
     # Define function schema for image generation
-    generate_image_schema = FunctionSchema(
+    generate_image_function = FunctionSchema(
         name="generate_image",
         description="Generate an image based on a text description",
-        parameters=[
-            ParameterSchema(
-                name="prompt",
-                description="A detailed description of the image to generate",
-                type="string",
-                required=True
-            )
-        ]
+        properties={
+            "prompt": {
+                "type": "string",
+                "description": "A detailed description of the image to generate"
+            }
+        },
+        required=["prompt"]
     )
 
+    # Create a tools schema with the function
+    tools = ToolsSchema(standard_tools=[generate_image_function])
+
     # Define function handler for image generation
-    async def handle_generate_image(prompt: str):
-        logger.info("Function called: generate_image with prompt: {}", prompt)
-        await image_queue.put(prompt)
-        return {
-            "success": True,
-            "message": "Image generation has been requested and will be displayed shortly."
-        }
+    async def handle_generate_image(function_name, tool_call_id, args, llm, context, result_callback):
+        logger.info("Function called: {} with args: {}", function_name, args)
+        prompt = args.get("prompt", "")
+        if prompt:
+            await image_queue.put(prompt)
+            result = {
+                "success": True,
+                "message": "Image generation has been requested and will be displayed shortly."
+            }
+            await result_callback(result)
 
     # Create LLM service with function calling capability
     llm = OpenAILLMService(
         api_key=os.getenv("OPENAI_API_KEY"), 
-        model="gpt-4o",
-        functions=[generate_image_schema],
-        function_handlers={"generate_image": handle_generate_image}
+        model="gpt-4o"
+    )
+    
+    # Register the function
+    llm.register_function(
+        "generate_image",
+        handle_generate_image
     )
 
     messages = [
@@ -213,13 +223,17 @@ async def main(room_url: str, token: str):
                 "Remember previous interactions in this session to maintain context and personalize responses. "
                 "End every response with the exact string ' {}'. So if your response was, 'how old are you?' you would return 'How old are you? {}'"
                 "\n\nYou have the ability to generate images to illustrate your stories and explanations. "
-                "When appropriate, use the generate_image function to create visual aids that complement your narrative. "
+                "When appropriate, use the generate_image function to illustrate your story or what the user is asking about."
                 "This is especially useful when describing new concepts, characters in stories, or complex ideas."
+                "When you generate an image, say 'sure, let me paint that for you.'"
             )
         }
     ]
 
-    context = OpenAILLMContext(messages)
+    context = OpenAILLMContext(
+        messages=messages,
+        tools=tools
+    )
     context_aggregator = llm.create_context_aggregator(context)
 
     logger.info("Creating pipeline with components")
@@ -294,7 +308,18 @@ async def main(room_url: str, token: str):
             # Log the complete conversation context for debugging
             logger.debug("Complete conversation context:")
             for idx, msg in enumerate(messages):
-                logger.debug("[{}] {}: {}", idx, msg["role"], msg["content"])
+                if "content" in msg:
+                    logger.debug("[{}] {}: {}", idx, msg["role"], msg["content"])
+                elif "tool_calls" in msg:
+                    # Handle function/tool call messages
+                    tool_calls_info = []
+                    for tool_call in msg["tool_calls"]:
+                        if "function" in tool_call:
+                            function_info = f"{tool_call['function'].get('name', 'unknown')}()"
+                            tool_calls_info.append(function_info)
+                    logger.debug("[{}] {}: tool_calls: {}", idx, msg["role"], ", ".join(tool_calls_info))
+                else:
+                    logger.debug("[{}] {}: [no content]", idx, msg["role"])
             
             # Wait 1.5 seconds after last speech to ensure user is done (increased from 0.5)
             logger.info("Waiting for user to complete speaking...")
